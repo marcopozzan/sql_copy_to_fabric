@@ -2,7 +2,7 @@
 
 > **Copia dati da SQL Server verso Azure Data Lake Storage Gen2 in formato Parquet, fuori da Microsoft Fabric — per risparmiare CU e mantenerle disponibili per analytics e reporting.**
 
-Sviluppato da [Regolo Farm](https://www.regolofarm.it) — AI & Business Intelligence · Polo Tecnologico di Pordenone
+Sviluppato da Marco Pozzan
 
 ---
 
@@ -334,9 +334,7 @@ I file Parquet prodotti sono direttamente compatibili con:
 
 ## Sviluppato da
 
-**Regolo Farm S.r.l.**  
-AI & Business Intelligence · Microsoft Fabric · Power BI · Azure  
-Polo Tecnologico di Pordenone — Friuli Venezia Giulia
+Marco Pozzan
 
 > *"Come i navigatori del Quattrocento tracciavano rotte verso l'ignoto, noi guidiamo le imprese verso il futuro dei dati."*
 
@@ -344,4 +342,4 @@ Polo Tecnologico di Pordenone — Friuli Venezia Giulia
 
 ## Licenza
 
-Uso interno Regolo Farm. Per licenze commerciali o contributi, contattare [info@regolofarm.it](mailto:info@regolofarm.it).
+Uso interno Regolo Farm. Per licenze commerciali o contributi, contattare [info@marcopozzan.it](mailto:info@marcopozzan.it).
