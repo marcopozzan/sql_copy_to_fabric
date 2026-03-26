@@ -416,7 +416,7 @@ I file Parquet prodotti sono direttamente compatibili con:
 
 ## Sviluppato da
 
-**Regolo Farm S.r.l.**  
+**Marco Pozzan**  
 AI & Business Intelligence · Microsoft Fabric · Power BI · Azure  
 Polo Tecnologico di Pordenone — Friuli Venezia Giulia
 
@@ -426,4 +426,4 @@ Polo Tecnologico di Pordenone — Friuli Venezia Giulia
 
 ## Licenza
 
-Uso interno Regolo Farm. Per licenze commerciali o contributi, contattare info@regolofarm.it.
+MIT License
