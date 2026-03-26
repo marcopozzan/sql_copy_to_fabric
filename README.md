@@ -2,7 +2,7 @@
 
 > **Copia dati da SQL Server verso Azure Data Lake Storage Gen2 o Microsoft Fabric OneLake in formato Parquet, fuori da Microsoft Fabric — per risparmiare CU e mantenerle disponibili per analytics e reporting.**
 
-Sviluppato da [Regolo Farm](https://www.regolofarm.it) — AI & Business Intelligence · Polo Tecnologico di Pordenone
+Sviluppato da [Marco Pozzan](https://www.regolofarm.it) — AI & Business Intelligence · Polo Tecnologico di Pordenone
 
 ---
 
