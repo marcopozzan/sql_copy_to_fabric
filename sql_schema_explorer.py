@@ -145,36 +145,113 @@ def fetch_schema(conn):
 #  HELPERS ADLS GEN2
 # ═══════════════════════════════════════════════════════════════════════════════
 def get_adls_client(ac: dict):
-    """Restituisce DataLakeServiceClient in base al metodo di autenticazione."""
+    """
+    Restituisce DataLakeServiceClient per ADLS Gen2 o OneLake.
+
+    OneLake DFS endpoint:
+      URL base:   https://onelake.dfs.fabric.microsoft.com/<workspace_name>
+      Filesystem: <lakehouse_name>.Lakehouse
+      Scope auth: https://storage.azure.com/.default
+
+    ADLS Gen2:
+      URL base:   https://<account_name>.dfs.core.windows.net
+      Filesystem: <container_name>
+    """
     from azure.storage.filedatalake import DataLakeServiceClient
     method = ac.get("auth_method", "account_key")
-    account = ac["account_name"]
-    url = f"https://{account}.dfs.core.windows.net"
-    if method == "account_key":
-        from azure.storage.filedatalake import DataLakeServiceClient
-        return DataLakeServiceClient(account_url=url,
-                                     credential=ac["account_key"])
-    elif method == "sas_token":
-        return DataLakeServiceClient(account_url=url + "?" + ac["sas_token"].lstrip("?"))
-    elif method == "service_principal":
-        from azure.identity import ClientSecretCredential
-        cred = ClientSecretCredential(ac["tenant_id"], ac["client_id"], ac["client_secret"])
-        return DataLakeServiceClient(account_url=url, credential=cred)
-    elif method == "managed_identity":
-        from azure.identity import ManagedIdentityCredential
-        return DataLakeServiceClient(account_url=url, credential=ManagedIdentityCredential())
-    raise ValueError(f"Metodo di autenticazione non supportato: {method}")
+    dest   = ac.get("destination", "adls")
+
+    if dest == "onelake":
+        ws  = ac.get("workspace_name", "").strip()
+        # L'account_url per OneLake include il workspace nel path
+        url = f"https://onelake.dfs.fabric.microsoft.com/{ws}"
+        # OneLake richiede lo scope storage.azure.com, non il default
+        ONELAKE_SCOPE = "https://storage.azure.com/.default"
+        if method == "service_principal":
+            from azure.identity import ClientSecretCredential
+            cred = ClientSecretCredential(
+                ac["tenant_id"], ac["client_id"], ac["client_secret"])
+            # Wrappa la credential per usare lo scope OneLake
+            from azure.core.credentials import TokenCredential, AccessToken
+            class _ScopedCred:
+                def __init__(self, inner): self._inner = inner
+                def get_token(self, *scopes, **kw):
+                    return self._inner.get_token(ONELAKE_SCOPE, **kw)
+            return DataLakeServiceClient(account_url=url, credential=_ScopedCred(cred))
+        elif method == "managed_identity":
+            from azure.identity import ManagedIdentityCredential
+            cred = ManagedIdentityCredential()
+            from azure.core.credentials import AccessToken
+            class _ScopedCred:
+                def __init__(self, inner): self._inner = inner
+                def get_token(self, *scopes, **kw):
+                    return self._inner.get_token(ONELAKE_SCOPE, **kw)
+            return DataLakeServiceClient(account_url=url, credential=_ScopedCred(cred))
+        else:
+            raise ValueError(
+                "OneLake supporta solo Service Principal o Managed Identity.\n"
+                "Account Key e SAS Token non sono supportati da OneLake.")
+    else:
+        account = ac["account_name"]
+        url = f"https://{account}.dfs.core.windows.net"
+        if method == "account_key":
+            return DataLakeServiceClient(account_url=url, credential=ac["account_key"])
+        elif method == "sas_token":
+            return DataLakeServiceClient(account_url=url + "?" + ac["sas_token"].lstrip("?"))
+        elif method == "service_principal":
+            from azure.identity import ClientSecretCredential
+            cred = ClientSecretCredential(ac["tenant_id"], ac["client_id"], ac["client_secret"])
+            return DataLakeServiceClient(account_url=url, credential=cred)
+        elif method == "managed_identity":
+            from azure.identity import ManagedIdentityCredential
+            return DataLakeServiceClient(account_url=url, credential=ManagedIdentityCredential())
+        raise ValueError(f"Metodo di autenticazione non supportato: {method}")
+
+
+def _onelake_filesystem(ac: dict) -> str:
+    """Restituisce il nome del filesystem OneLake: '<lakehouse>.Lakehouse'."""
+    lh = ac.get("lakehouse_name", "").strip()
+    return f"{lh}.Lakehouse"
+
+
+def adls_upload_parquet_partitioned(client, container: str, root_path: str,
+                                    df, partition_cols: list, fallback_path: str):
+    """
+    Scrive il DataFrame come dataset Parquet partizionato su ADLS/OneLake.
+    Ogni partizione unica genera un file separato nella struttura:
+      root_path/<col1=val1>/<col2=val2>/part-0.parquet
+    Se il DataFrame e' vuoto scrive comunque il file fallback vuoto.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import io as _io
+
+    # Filtra colonne di partizione esistenti nel df
+    pcols = [c for c in partition_cols if c in df.columns]
+    if not pcols or df.empty:
+        # Fallback: file singolo non partizionato
+        adls_upload_parquet(client, container, fallback_path, df)
+        return
+
+    # Raggruppa per valori unici delle colonne di partizione
+    for keys, group in df.groupby(pcols, sort=False):
+        if not isinstance(keys, tuple):
+            keys = (keys,)
+        # Costruisci il percorso di partizione: col=val/col2=val2/...
+        part_segments = "/".join(f"{c}={v}" for c, v in zip(pcols, keys))
+        part_path = f"{root_path}/{part_segments}/part-0.parquet"
+        adls_upload_parquet(client, container, part_path, group)
 
 
 def adls_upload_parquet(client, container: str, blob_path: str, df):
-    """Carica un DataFrame pandas come parquet su ADLS Gen2."""
+    """Carica un DataFrame pandas come parquet su ADLS Gen2 o OneLake."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     buf = io.BytesIO()
     table = pa.Table.from_pandas(df, preserve_index=False)
     pq.write_table(table, buf)
     buf.seek(0)
-    fs_client  = client.get_file_system_client(container)
+    fs_client   = client.get_file_system_client(container)
     file_client = fs_client.get_file_client(blob_path)
     file_client.create_file()
     data = buf.getvalue()
@@ -183,12 +260,12 @@ def adls_upload_parquet(client, container: str, blob_path: str, df):
 
 
 def adls_delete_folder(client, container: str, folder_path: str):
-    """Elimina ricorsivamente una cartella su ADLS Gen2 (se esiste)."""
+    """Elimina ricorsivamente una cartella (se esiste)."""
     try:
         fs = client.get_file_system_client(container)
         fs.get_directory_client(folder_path).delete_directory()
     except Exception:
-        pass   # cartella inesistente: ok
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -385,107 +462,207 @@ class AdlsDialog(tk.Toplevel):
     PATH_TOKENS = ["{base}","{schema}","{table}","{YYYY}","{MM}","{DD}","{file}"]
     PATH_DEFAULT = "{base}/{table}/{YYYY}/{MM}/{DD}/{file}.parquet"
 
+    # Colore OneLake (viola Fabric)
+    _COLOR_OL = "#5B2D8E"
+
     def _build(self):
-        hdr=tk.Frame(self,bg=C_TEAL,padx=24,pady=14); hdr.pack(fill="x")
-        tk.Label(hdr,text="☁  Azure Data Lake Storage Gen2",font=("Calibri Light",14,"bold"),
-                 bg=C_TEAL,fg=C_WHITE).pack(side="left")
-        tk.Label(hdr,text="Regolo Farm",font=FONT_SMALL,bg=C_TEAL,fg="#A8E6CF").pack(side="right")
+        # ── Header ────────────────────────────────────────────────────────────
+        self._hdr_frame=tk.Frame(self,bg=C_TEAL,padx=24,pady=14); self._hdr_frame.pack(fill="x")
+        self._hdr_lbl=tk.Label(self._hdr_frame,text="☁  Destinazione Storage",
+                                 font=("Calibri Light",14,"bold"),bg=C_TEAL,fg=C_WHITE)
+        self._hdr_lbl.pack(side="left")
+        tk.Label(self._hdr_frame,text="Regolo Farm",font=FONT_SMALL,bg=C_TEAL,fg="#A8E6CF").pack(side="right")
 
-        body=tk.Frame(self,bg=C_WHITE,padx=28,pady=20); body.pack(fill="both",expand=True)
-        def lbl(t,r): tk.Label(body,text=t,font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w").grid(row=r,column=0,sticky="nw",pady=5)
-        def ent(r,show=None,w=36):
-            e=tk.Entry(body,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,relief="flat",bd=0,
-                       highlightthickness=1,highlightbackground=C_GRAY_LINE,
-                       highlightcolor=C_TEAL,width=w,show=show)
-            e.grid(row=r,column=1,sticky="ew",padx=(12,0),pady=5); return e
+        # ── Selector ADLS / OneLake ────────────────────────────────────────────
+        dest_bar=tk.Frame(self,bg=C_SKY_LIGHT,padx=20,pady=10); dest_bar.pack(fill="x")
+        tk.Label(dest_bar,text="Destinazione:",font=FONT_HEAD,bg=C_SKY_LIGHT,fg=C_NAVY).pack(side="left")
+        self._dest=tk.StringVar(value=self._init.get("destination","adls"))
+        for label,val,ico in [("ADLS Gen2","adls","🗄"),("Microsoft Fabric OneLake","onelake","🔷")]:
+             tk.Radiobutton(dest_bar,text=f"{ico}  {label}",variable=self._dest,value=val,
+                            bg=C_SKY_LIGHT,fg=C_NAVY,font=FONT_HEAD,activebackground=C_SKY_LIGHT,
+                            command=self._tog_dest).pack(side="left",padx=(14,0))
 
-        lbl("Storage Account Name",0); self.e_acc=ent(0)
-        lbl("Container (filesystem)",1); self.e_con=ent(1)
+        # ── Body parametri ─────────────────────────────────────────────────────
+        body=tk.Frame(self,bg=C_WHITE,padx=28,pady=16); body.pack(fill="both",expand=True)
+        self._body=body
 
-        # Metodo autenticazione
-        lbl("Autenticazione",2)
+        def ent_row(r,show=None,w=36,hl=C_TEAL):
+             e=tk.Entry(body,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,relief="flat",bd=0,
+                        highlightthickness=1,highlightbackground=C_GRAY_LINE,
+                        highlightcolor=hl,width=w,show=show)
+             e.grid(row=r,column=1,sticky="ew",padx=(12,0),pady=5); return e
+
+        def lbl_row(t,r):
+             l=tk.Label(body,text=t,font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w")
+             l.grid(row=r,column=0,sticky="nw",pady=5); return l
+
+        # -- ADLS fields (righe 0,1)
+        self._lbl_acc=lbl_row("Storage Account Name",0); self.e_acc=ent_row(0)
+        self._lbl_con=lbl_row("Container (filesystem)",1); self.e_con=ent_row(1)
+
+        # -- OneLake fields (righe 0,1,2,3 — sovrapposte alle ADLS)
+        self._lbl_ws=tk.Label(body,text="Workspace Name",font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w")
+        self._lbl_ws.grid(row=0,column=0,sticky="nw",pady=5)
+        self.e_ws=tk.Entry(body,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,relief="flat",bd=0,
+                             highlightthickness=1,highlightbackground=C_GRAY_LINE,
+                             highlightcolor=self._COLOR_OL,width=36)
+        self.e_ws.grid(row=0,column=1,sticky="ew",padx=(12,0),pady=5)
+
+        self._lbl_lh=tk.Label(body,text="Lakehouse Name",font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w")
+        self._lbl_lh.grid(row=1,column=0,sticky="nw",pady=5)
+        self.e_lh=tk.Entry(body,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,relief="flat",bd=0,
+                             highlightthickness=1,highlightbackground=C_GRAY_LINE,
+                             highlightcolor=self._COLOR_OL,width=36)
+        self.e_lh.grid(row=1,column=1,sticky="ew",padx=(12,0),pady=5)
+
+        self._lbl_sub=tk.Label(body,text="Sottocartella Files/ (opz.)",font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w")
+        self._lbl_sub.grid(row=2,column=0,sticky="nw",pady=5)
+        self.e_sub=tk.Entry(body,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,relief="flat",bd=0,
+                              highlightthickness=1,highlightbackground=C_GRAY_LINE,
+                              highlightcolor=self._COLOR_OL,width=36)
+        self.e_sub.grid(row=2,column=1,sticky="ew",padx=(12,0),pady=5)
+        self._note_sub=tk.Label(body,text="es. raw/sqlserver — lasciare vuoto per Files/",
+                                  font=FONT_SMALL,bg=C_WHITE,fg=C_TEXT_MUT)
+        self._note_sub.grid(row=2,column=1,sticky="e")
+        self._note_ol=tk.Label(body,
+             text="Il percorso sara': <Workspace>/<Lakehouse>.Lakehouse/Files/<sottocartella>/...",
+             font=FONT_SMALL,bg=C_WHITE,fg=self._COLOR_OL,justify="left",anchor="w",wraplength=460)
+        self._note_ol.grid(row=3,column=0,columnspan=2,sticky="w",pady=(0,6))
+
+        # ── Autenticazione ─────────────────────────────────────────────────────
+        self._lbl_auth=tk.Label(body,text="Autenticazione",font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w")
+        self._lbl_auth.grid(row=4,column=0,sticky="nw",pady=5)
         self._auth=tk.StringVar(value=self._init.get("auth_method","account_key"))
-        auth_frame=tk.Frame(body,bg=C_WHITE)
-        auth_frame.grid(row=3,column=0,columnspan=2,sticky="w",pady=(2,6))
-        for t,v in [("Account Key","account_key"),("SAS Token","sas_token"),
-                    ("Service Principal","service_principal"),("Managed Identity","managed_identity")]:
-            tk.Radiobutton(auth_frame,text=t,variable=self._auth,value=v,
-                           bg=C_WHITE,fg=C_TEXT,font=FONT_BODY,activebackground=C_WHITE,
-                           command=self._tog_auth).pack(side="left",padx=(0,12))
+        self._auth_frame=tk.Frame(body,bg=C_WHITE)
+        self._auth_frame.grid(row=5,column=0,columnspan=2,sticky="w",pady=(2,6))
+        self._build_auth_radios()
 
-        # Campi dinamici per autenticazione
         self._dyn_frame=tk.Frame(body,bg=C_WHITE)
-        self._dyn_frame.grid(row=4,column=0,columnspan=2,sticky="ew")
+        self._dyn_frame.grid(row=6,column=0,columnspan=2,sticky="ew")
         self._dyn_widgets={}
         self._build_dyn()
 
-        # ── Sezione percorso file ──────────────────────────────────────────────
-        sep=tk.Frame(body,bg=C_GRAY_LINE,height=1)
-        sep.grid(row=5,column=0,columnspan=2,sticky="ew",pady=(12,8))
+        # ── Percorso ───────────────────────────────────────────────────────────
+        tk.Frame(body,bg=C_GRAY_LINE,height=1).grid(row=7,column=0,columnspan=2,sticky="ew",pady=(12,8))
 
-        lbl("Template percorso",6)
+        tk.Label(body,text="Template percorso",font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w"
+                  ).grid(row=8,column=0,sticky="nw",pady=5)
         path_frame=tk.Frame(body,bg=C_WHITE)
-        path_frame.grid(row=6,column=1,sticky="ew",padx=(12,0),pady=4)
+        path_frame.grid(row=8,column=1,sticky="ew",padx=(12,0),pady=4)
         self.e_path=tk.Entry(path_frame,font=FONT_MONO,bg=C_GRAY_BG,fg=C_NAVY,
-                              relief="flat",bd=0,highlightthickness=1,
-                              highlightbackground=C_GRAY_LINE,highlightcolor=C_TEAL,width=44)
+                               relief="flat",bd=0,highlightthickness=1,
+                               highlightbackground=C_GRAY_LINE,highlightcolor=C_TEAL,width=44)
         self.e_path.pack(side="left",fill="x",expand=True,ipady=3)
         tk.Button(path_frame,text="↺",command=self._reset_path,font=("Calibri",11),
-                  bg=C_TEAL,fg=C_WHITE,relief="flat",bd=0,padx=6,pady=2,
-                  cursor="hand2",activebackground="#0A5D60",
-                  ).pack(side="left",padx=(4,0))
+                bg=C_TEAL,fg=C_WHITE,relief="flat",bd=0,padx=6,pady=2,
+                cursor="hand2",activebackground="#0A5D60").pack(side="left",padx=(4,0))
 
-        # Riga token cliccabili
         tk.Label(body,text="Token:",font=FONT_SMALL,bg=C_WHITE,fg=C_TEXT_MUT,anchor="w"
-                 ).grid(row=7,column=0,sticky="w",pady=(0,4))
+                  ).grid(row=9,column=0,sticky="w",pady=(0,4))
         tok_frame=tk.Frame(body,bg=C_WHITE)
-        tok_frame.grid(row=7,column=1,sticky="w",padx=(12,0),pady=(0,4))
+        tok_frame.grid(row=9,column=1,sticky="w",padx=(12,0),pady=(0,4))
         for tok in self.PATH_TOKENS:
-            tk.Button(tok_frame,text=tok,command=lambda t=tok:self._insert_token(t),
-                      font=FONT_MONO,bg=C_SKY_LIGHT,fg=C_NAVY,relief="flat",bd=0,
-                      padx=6,pady=2,cursor="hand2",
-                      activebackground=C_SKY).pack(side="left",padx=2)
+             tk.Button(tok_frame,text=tok,command=lambda t=tok:self._insert_token(t),
+                       font=FONT_MONO,bg=C_SKY_LIGHT,fg=C_NAVY,relief="flat",bd=0,
+                       padx=6,pady=2,cursor="hand2",activebackground=C_SKY).pack(side="left",padx=2)
 
-        # Descrizione token
-        token_help = (
-            "{base} = cartella base   {schema} = schema SQL   {table} = nome tabella\n"
-            "{YYYY} = anno   {MM} = mese   {DD} = giorno   {file} = nome file (=tabella)"
-        )
-        tk.Label(body,text=token_help,font=("Calibri",8),bg=C_WHITE,fg=C_TEXT_MUT,
-                 justify="left",anchor="w"
-                 ).grid(row=8,column=0,columnspan=2,sticky="w",padx=(12,0),pady=(0,6))
+        tk.Label(body,text="{base}=cartella base  {schema}=schema SQL  {table}=tabella  {YYYY}{MM}{DD}=data  {file}=file",
+                  font=("Calibri",8),bg=C_WHITE,fg=C_TEXT_MUT,justify="left",anchor="w"
+                  ).grid(row=10,column=0,columnspan=2,sticky="w",padx=(12,0),pady=(0,6))
 
-        # Cartella base (rimane per retrocompatibilità, usata dal token {base})
-        lbl("Cartella base",9); self.e_base=ent(9)
-        tk.Label(body,text="valore per il token {base} — es. raw/sqlserver",
-                 font=FONT_SMALL,bg=C_WHITE,fg=C_TEXT_MUT).grid(row=9,column=1,sticky="e")
+        tk.Label(body,text="Cartella base",font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w"
+                  ).grid(row=11,column=0,sticky="nw",pady=5)
+        self.e_base=tk.Entry(body,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,relief="flat",bd=0,
+                               highlightthickness=1,highlightbackground=C_GRAY_LINE,
+                               highlightcolor=C_TEAL,width=36)
+        self.e_base.grid(row=11,column=1,sticky="ew",padx=(12,0),pady=5)
+        tk.Label(body,text="valore per il token {base}",
+                  font=FONT_SMALL,bg=C_WHITE,fg=C_TEXT_MUT).grid(row=11,column=1,sticky="e")
 
         body.columnconfigure(1,weight=1)
 
-        # Preview URL
+        # ── Preview ────────────────────────────────────────────────────────────
         pv=tk.Frame(self,bg=C_GRAY_BG,padx=20,pady=10); pv.pack(fill="x")
-        ph=tk.Frame(pv,bg=C_GRAY_BG); ph.pack(fill="x")
-        tk.Label(ph,text="Preview percorso completo:",font=FONT_SMALL,bg=C_GRAY_BG,fg=C_TEXT_MUT).pack(side="left")
+        tk.Label(pv,text="Preview percorso completo:",font=FONT_SMALL,bg=C_GRAY_BG,fg=C_TEXT_MUT).pack(anchor="w")
         self._prev=tk.StringVar()
         tk.Label(pv,textvariable=self._prev,font=FONT_MONO,bg=C_GRAY_BG,fg=C_TEAL,
-                 wraplength=600,justify="left").pack(anchor="w",pady=(4,0))
+                  wraplength=600,justify="left").pack(anchor="w",pady=(4,0))
 
         for v in (self._auth,): v.trace_add("write",self._upd_prev)
-        for e in (self.e_acc,self.e_con,self.e_base,self.e_path): e.bind("<KeyRelease>",lambda _:self._upd_prev())
+        for e in (self.e_acc,self.e_con,self.e_ws,self.e_lh,self.e_sub,self.e_base,self.e_path):
+             e.bind("<KeyRelease>",lambda _:self._upd_prev())
 
-        # Bottoni
+        # ── Bottoni ────────────────────────────────────────────────────────────
         bf=tk.Frame(self,bg=C_WHITE,pady=14); bf.pack()
         tk.Button(bf,text="  Salva  ",command=self._ok,font=FONT_HEAD,
-                  bg=C_TEAL,fg=C_WHITE,relief="flat",bd=0,padx=14,pady=7,
-                  cursor="hand2",activebackground="#0A5D60").pack(side="left",padx=6)
+                bg=C_TEAL,fg=C_WHITE,relief="flat",bd=0,padx=14,pady=7,
+                cursor="hand2",activebackground="#0A5D60").pack(side="left",padx=6)
         tk.Button(bf,text="  Test connessione  ",command=self._test,font=FONT_HEAD,
-                  bg=C_NAVY,fg=C_WHITE,relief="flat",bd=0,padx=14,pady=7,
-                  cursor="hand2",activebackground=C_HOVER).pack(side="left",padx=6)
+                bg=C_NAVY,fg=C_WHITE,relief="flat",bd=0,padx=14,pady=7,
+                cursor="hand2",activebackground=C_HOVER).pack(side="left",padx=6)
         tk.Button(bf,text="  Annulla  ",command=self.destroy,font=FONT_HEAD,
-                  bg=C_GRAY_LINE,fg=C_TEXT,relief="flat",bd=0,padx=14,pady=7,
-                  cursor="hand2").pack(side="left",padx=6)
+                bg=C_GRAY_LINE,fg=C_TEXT,relief="flat",bd=0,padx=14,pady=7,
+                cursor="hand2").pack(side="left",padx=6)
 
         self._fill_initial()
+        self._initializing = True
+        self._tog_dest()
+        self._initializing = False
+
+
+    def _build_auth_radios(self):
+        """Costruisce i radio button per l'autenticazione in base alla destinazione."""
+        for w in self._auth_frame.winfo_children(): w.destroy()
+        dest = self._dest.get() if hasattr(self,'_dest') else "adls"
+        if dest == "onelake":
+             # OneLake: solo Service Principal e Managed Identity
+             options = [("Service Principal","service_principal"),
+                        ("Managed Identity","managed_identity")]
+             # Se il metodo corrente non e' compatibile, reimposta
+             if self._auth.get() not in ("service_principal","managed_identity"):
+                 self._auth.set("service_principal")
+        else:
+             options = [("Account Key","account_key"),("SAS Token","sas_token"),
+                        ("Service Principal","service_principal"),("Managed Identity","managed_identity")]
+        for t,v in options:
+             tk.Radiobutton(self._auth_frame,text=t,variable=self._auth,value=v,
+                            bg=C_WHITE,fg=C_TEXT,font=FONT_BODY,activebackground=C_WHITE,
+                            command=self._tog_auth).pack(side="left",padx=(0,12))
+
+    def _tog_dest(self,*_):
+        """Mostra/nasconde i campi ADLS o OneLake in base alla selezione."""
+        dest = self._dest.get()
+        is_ol = (dest == "onelake")
+        hl_color = self._COLOR_OL if is_ol else C_TEAL
+
+        # Header colore
+        col = self._COLOR_OL if is_ol else C_TEAL
+        self._hdr_frame.configure(bg=col)
+        self._hdr_lbl.configure(bg=col,
+             text=("🔷  Microsoft Fabric OneLake" if is_ol else "☁  Azure Data Lake Storage Gen2"))
+
+        # Mostra/nascondi widget ADLS
+        for w in (self._lbl_acc, self.e_acc, self._lbl_con, self.e_con):
+             if is_ol: w.grid_remove()
+             else:     w.grid()
+
+        # Mostra/nascondi widget OneLake
+        for w in (self._lbl_ws, self.e_ws, self._lbl_lh, self.e_lh,
+                self._lbl_sub, self.e_sub, self._note_sub, self._note_ol):
+             if is_ol: w.grid()
+             else:     w.grid_remove()
+
+        # Aggiorna highlight color del path entry
+        self.e_path.configure(highlightcolor=hl_color)
+        self.e_base.configure(highlightcolor=hl_color)
+
+        # Ricostruisce i radio auth compatibili con la destinazione
+        # NON chiama _fill_dyn: i campi dinamici devono mantenere i valori digitati dall'utente
+        self._build_auth_radios()
+        self._build_dyn()
+        # Riempie i campi dinamici solo durante l'inizializzazione (dati da self._init)
+        if getattr(self, "_initializing", False):
+            self._fill_dyn()
         self._upd_prev()
 
     def _build_dyn(self):
@@ -494,59 +671,83 @@ class AdlsDialog(tk.Toplevel):
         m=self._auth.get()
         specs=[]
         if m=="account_key":
-            specs=[("Account Key","account_key","●",38)]
+             specs=[("Account Key","account_key","●",38)]
         elif m=="sas_token":
-            specs=[("SAS Token","sas_token","●",38)]
+             specs=[("SAS Token","sas_token","●",38)]
         elif m=="service_principal":
-            specs=[("Tenant ID","tenant_id",None,36),
-                   ("Client ID","client_id",None,36),
-                   ("Client Secret","client_secret","●",36)]
-        # managed_identity: no campi
+             specs=[("Tenant ID","tenant_id",None,36),
+                    ("Client ID","client_id",None,36),
+                    ("Client Secret","client_secret","●",36)]
+        hl=self._COLOR_OL if self._dest.get()=="onelake" else C_TEAL
         for i,(label,key,show,w) in enumerate(specs):
-            tk.Label(self._dyn_frame,text=label,font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w"
-                     ).grid(row=i,column=0,sticky="w",pady=4)
-            e=tk.Entry(self._dyn_frame,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,
-                       relief="flat",bd=0,highlightthickness=1,
-                       highlightbackground=C_GRAY_LINE,highlightcolor=C_TEAL,
-                       width=w,show=show or "")
-            e.grid(row=i,column=1,sticky="ew",padx=(12,0),pady=4)
-            self._dyn_widgets[key]=e
-            self._dyn_frame.columnconfigure(1,weight=1)
+             tk.Label(self._dyn_frame,text=label,font=FONT_HEAD,bg=C_WHITE,fg=C_TEXT,anchor="w"
+                      ).grid(row=i,column=0,sticky="w",pady=4)
+             e=tk.Entry(self._dyn_frame,font=FONT_BODY,bg=C_GRAY_BG,fg=C_TEXT,
+                        relief="flat",bd=0,highlightthickness=1,
+                        highlightbackground=C_GRAY_LINE,highlightcolor=hl,
+                        width=w,show=show or "")
+             e.grid(row=i,column=1,sticky="ew",padx=(12,0),pady=4)
+             self._dyn_widgets[key]=e
+             self._dyn_frame.columnconfigure(1,weight=1)
         if m=="managed_identity":
-            tk.Label(self._dyn_frame,text="ℹ  Nessuna credenziale richiesta (Azure-hosted)",
-                     font=FONT_SMALL,bg=C_WHITE,fg=C_TEXT_MUT,anchor="w"
-                     ).grid(row=0,column=0,columnspan=2,sticky="w",pady=6)
+             tk.Label(self._dyn_frame,
+                      text="Nessuna credenziale richiesta (Azure-hosted / Fabric)",
+                      font=FONT_SMALL,bg=C_WHITE,fg=C_TEXT_MUT,anchor="w"
+                      ).grid(row=0,column=0,columnspan=2,sticky="w",pady=6)
 
     def _tog_auth(self):
         self._build_dyn()
-        self._fill_dyn()
+        # Riempie solo se siamo in fase di init, non su toggle manuale dell'utente
+        if getattr(self, "_initializing", False):
+            self._fill_dyn()
         self._upd_prev()
 
     def _fill_initial(self):
         p=self._init
+        dest=p.get("destination","adls")
+        self._dest.set(dest)
+        # ADLS fields
         for e,k in [(self.e_acc,"account_name"),(self.e_con,"container"),(self.e_base,"base_folder")]:
-            e.delete(0,"end"); e.insert(0,p.get(k,""))
+             e.delete(0,"end"); e.insert(0,p.get(k,""))
+        # OneLake fields
+        for e,k in [(self.e_ws,"workspace_name"),(self.e_lh,"lakehouse_name"),(self.e_sub,"ol_subfolder")]:
+             e.delete(0,"end"); e.insert(0,p.get(k,""))
         self._auth.set(p.get("auth_method","account_key"))
-        # Carica template percorso (default se non presente)
         self.e_path.delete(0,"end")
         self.e_path.insert(0, p.get("path_template", self.PATH_DEFAULT))
-        self._build_dyn(); self._fill_dyn()
+        # _build_dyn e _fill_dyn vengono chiamati da _tog_dest() subito dopo
 
     def _fill_dyn(self):
         p=self._init
         for key,e in self._dyn_widgets.items():
-            e.delete(0,"end"); e.insert(0,p.get(key,""))
+             e.delete(0,"end"); e.insert(0,p.get(key,""))
 
     def _upd_prev(self,*_):
-        acc  = self.e_acc.get().strip()  or "<account>"
-        con  = self.e_con.get().strip()  or "<container>"
-        base = self.e_base.get().strip() or ""
+        dest = self._dest.get() if hasattr(self,"_dest") else "adls"
         tmpl = self.e_path.get().strip() or self.PATH_DEFAULT
+        base = self.e_base.get().strip() or ""
         now  = datetime.now()
         path = resolve_path_template(tmpl,
-            base=base, schema="dbo", table="NomeTabella",
-            now=now, file_name="NomeTabella")
-        self._prev.set(f"abfss://{con}@{acc}.dfs.core.windows.net/{path}")
+             base=base, schema="dbo", table="NomeTabella",
+             now=now, file_name="NomeTabella")
+        if dest == "onelake":
+             ws  = self.e_ws.get().strip()  or "<workspace>"
+             lh  = self.e_lh.get().strip()  or "<lakehouse>"
+             sub = self.e_sub.get().strip()
+             # Struttura OneLake: workspace/lakehouse.Lakehouse/Files/[sub/]path
+             # Il path e' relativo al filesystem "{lh}.Lakehouse"
+             files_root = f"Files/{sub.strip('/')}" if sub else "Files"
+             full = resolve_path_template(tmpl,
+                 base=files_root, schema="dbo", table="NomeTabella",
+                 now=now, file_name="NomeTabella")
+             # Preview URL completo: workspace/lakehouse.Lakehouse/Files/...
+             lh_fs = f"{lh}.Lakehouse"
+             preview = f"https://onelake.dfs.fabric.microsoft.com/{ws}/{lh_fs}/{full}"
+        else:
+             acc = self.e_acc.get().strip() or "<account>"
+             con = self.e_con.get().strip() or "<container>"
+             preview = f"abfss://{con}@{acc}.dfs.core.windows.net/{path}"
+        self._prev.set(preview)
 
     def _reset_path(self):
         self.e_path.delete(0,"end")
@@ -554,56 +755,189 @@ class AdlsDialog(tk.Toplevel):
         self._upd_prev()
 
     def _insert_token(self, token):
-        """Inserisce il token nella posizione corrente del cursore."""
         pos = self.e_path.index(tk.INSERT)
         self.e_path.insert(pos, token)
         self.e_path.icursor(pos + len(token))
         self._upd_prev()
 
     def _params(self):
-        p={"account_name":   self.e_acc.get().strip(),
-           "container":      self.e_con.get().strip(),
-           "base_folder":    self.e_base.get().strip(),
-           "auth_method":    self._auth.get(),
-           "path_template":  self.e_path.get().strip() or self.PATH_DEFAULT}
+        dest=self._dest.get()
+        p={"destination":    dest,
+            "auth_method":    self._auth.get(),
+            "path_template":  self.e_path.get().strip() or self.PATH_DEFAULT,
+            "base_folder":    self.e_base.get().strip()}
+        if dest == "onelake":
+             p["workspace_name"] = self.e_ws.get().strip()
+             p["lakehouse_name"] = self.e_lh.get().strip()
+             p["ol_subfolder"]   = self.e_sub.get().strip()
+             # account_name usato da get_adls_client per costruire l'URL
+             p["account_name"] = self.e_ws.get().strip()
+             # container per OneLake = "<lakehouse>.Lakehouse" — derivato a runtime
+             p["container"]    = f"{self.e_lh.get().strip()}.Lakehouse"
+        else:
+             p["account_name"] = self.e_acc.get().strip()
+             p["container"]    = self.e_con.get().strip()
         for key,e in self._dyn_widgets.items():
-            p[key]=e.get().strip()
+             p[key]=e.get().strip()
         return p
 
     def _test(self):
         p=self._params()
-        if not p["account_name"] or not p["container"]:
-            messagebox.showerror("Errore","Account name e Container obbligatori.",parent=self); return
-        try:
-            client=get_adls_client(p)
-            fs=client.get_file_system_client(p["container"])
-            list(fs.get_paths(max_results=1))
-            messagebox.showinfo("Connessione OK",
-                f"✓ Connesso a {p['account_name']}.dfs.core.windows.net\n"
-                f"Container: {p['container']}",parent=self)
-        except Exception as ex:
-            messagebox.showerror("Errore connessione ADLS",str(ex),parent=self)
+        dest=p.get("destination","adls")
+        if dest=="onelake":
+             if not p.get("workspace_name"):
+                 messagebox.showerror("Errore","Workspace Name obbligatorio.",parent=self); return
+             if not p.get("lakehouse_name"):
+                 messagebox.showerror("Errore","Lakehouse Name obbligatorio.",parent=self); return
+        else:
+             if not p.get("account_name") or not p.get("container"):
+                 messagebox.showerror("Errore","Account name e Container obbligatori.",parent=self); return
+
+        # ── Dialog di attesa con timeout ──────────────────────────────────────
+        TIMEOUT_SEC = 15
+
+        wait_dlg = tk.Toplevel(self)
+        wait_dlg.title("Test connessione")
+        wait_dlg.configure(bg=C_NAVY)
+        wait_dlg.resizable(False, False)
+        wait_dlg.grab_set()
+        wait_dlg.transient(self)
+
+        tk.Label(wait_dlg, text="Test connessione in corso…",
+                 font=FONT_HEAD, bg=C_NAVY, fg=C_WHITE,
+                 padx=30, pady=16).pack()
+
+        pb = ttk.Progressbar(wait_dlg, mode="indeterminate", length=300)
+        pb.pack(padx=30, pady=(0,8))
+        pb.start(12)
+
+        _countdown_var = tk.StringVar(value=f"Timeout: {TIMEOUT_SEC}s")
+        tk.Label(wait_dlg, textvariable=_countdown_var,
+                 font=FONT_SMALL, bg=C_NAVY, fg=C_SKY).pack(pady=(0,4))
+
+        _cancelled = {"v": False}
+
+        def _cancel():
+            _cancelled["v"] = True
+            try: wait_dlg.destroy()
+            except: pass
+
+        tk.Button(wait_dlg, text="Annulla", command=_cancel,
+                  font=FONT_SMALL, bg=C_GRAY_LINE, fg=C_TEXT,
+                  relief="flat", bd=0, padx=14, pady=6, cursor="hand2"
+                  ).pack(pady=(0,14))
+
+        wait_dlg.update_idletasks()
+        wait_dlg.geometry(
+            f"+{self.winfo_x()+(self.winfo_width()-wait_dlg.winfo_width())//2}"
+            f"+{self.winfo_y()+(self.winfo_height()-wait_dlg.winfo_height())//2}")
+
+        # Risultato dal thread
+        _result = {"ok": None, "msg": ""}
+
+        def _worker():
+            import threading as _th
+            done = _th.Event()
+            inner_result = {"ok": None, "msg": ""}
+
+            def _inner():
+                try:
+                    client = get_adls_client(p)
+                    if dest == "onelake":
+                        ws         = p["workspace_name"]
+                        lh         = p["lakehouse_name"]
+                        filesystem = f"{lh}.Lakehouse"
+                        fs         = client.get_file_system_client(filesystem)
+                        # OneLake policy: operazioni vietate sulla root del Lakehouse.
+                        # Usare get_directory_client("Files") per evitare OperationNotAllowedOnThePath
+                        list(fs.get_directory_client("Files").get_paths(max_results=1))
+                        inner_result["ok"]  = True
+                        inner_result["msg"] = (
+                            f"Connesso a OneLake\n"
+                            f"Workspace:  {ws}\n"
+                            f"Lakehouse:  {lh}\n"
+                            f"Filesystem: {filesystem}/Files")
+                    else:
+                        fs = client.get_file_system_client(p["container"])
+                        list(fs.get_paths(max_results=1))
+                        inner_result["ok"]  = True
+                        inner_result["msg"] = (
+                            f"Connesso a {p['account_name']}.dfs.core.windows.net\n"
+                            f"Container: {p['container']}")
+                except Exception as ex:
+                    inner_result["ok"]  = False
+                    inner_result["msg"] = str(ex)
+                finally:
+                    done.set()
+
+            t = _th.Thread(target=_inner, daemon=True)
+            t.start()
+            done.wait(timeout=TIMEOUT_SEC)
+
+            if not done.is_set():
+                _result["ok"]  = False
+                _result["msg"] = (
+                    f"Timeout: nessuna risposta entro {TIMEOUT_SEC} secondi.\n\n"
+                    "Verificare:\n"
+                    "  • Credenziali (Tenant ID, Client ID, Client Secret)\n"
+                    "  • Il Service Principal ha accesso al Workspace/Container\n"
+                    "  • Connettività di rete verso Azure")
+            else:
+                _result["ok"]  = inner_result["ok"]
+                _result["msg"] = inner_result["msg"]
+
+        import threading as _th
+
+        def _countdown(remaining):
+            if _cancelled["v"]: return
+            try:
+                _countdown_var.set(f"Timeout: {remaining}s")
+                if remaining > 0:
+                    self.after(1000, _countdown, remaining - 1)
+            except: pass
+
+        def _on_done():
+            if _cancelled["v"]: return
+            try: pb.stop(); wait_dlg.destroy()
+            except: pass
+            if _result["ok"] is None:
+                # thread non ancora finito — ricontrolla tra poco
+                self.after(200, _on_done); return
+            if _result["ok"]:
+                messagebox.showinfo("Connessione OK", _result["msg"], parent=self)
+            else:
+                messagebox.showerror("Errore connessione", _result["msg"], parent=self)
+
+        # Avvia worker e countdown
+        _th.Thread(target=_worker, daemon=True).start()
+        _countdown(TIMEOUT_SEC)
+        # Controlla ogni 200ms se il worker ha finito
+        self.after(200, _on_done)
+
 
     def _ok(self):
         p=self._params()
-        if not p["account_name"] or not p["container"]:
-            messagebox.showerror("Errore","Account name e Container obbligatori.",parent=self); return
+        dest=p.get("destination","adls")
+        if dest=="onelake":
+             if not p.get("workspace_name") or not p.get("lakehouse_name"):
+                 messagebox.showerror("Errore","Workspace Name e Lakehouse Name obbligatori.",parent=self); return
+        else:
+             if not p.get("account_name") or not p.get("container"):
+                 messagebox.showerror("Errore","Account name e Container obbligatori.",parent=self); return
         self.result=p; self.destroy()
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  DIALOG — LOG OPERAZIONE DI COPIA
 # ═══════════════════════════════════════════════════════════════════════════════
 class RunDialog(tk.Toplevel):
-    def __init__(self, parent):
+    def __init__(self, parent, on_last_run=None):
         super().__init__(parent)
-        self.title("Esecuzione copia → ADLS Gen2")
+        self.title("Esecuzione copia → ADLS Gen2 / OneLake")
         self.configure(bg=C_NAVY)
         self.geometry("780x520")
         self.resizable(True, True)
         self.transient(parent)
         self._q = queue.Queue()
         self._running = False
+        self._on_last_run = on_last_run   # callback(table_name, iso_timestamp)
         self._build()
 
     def _build(self):
@@ -677,6 +1011,10 @@ class RunDialog(tk.Toplevel):
                     self.set_progress(*item[1:])
                 elif item[0] == "status":
                     self.set_status(item[1], item[2])
+                elif item[0] == "update_last_run":
+                    # Propaga l'aggiornamento last_run al SchemaExplorer
+                    if self._on_last_run:
+                        self._on_last_run(item[1], item[2])
                 elif item[0] == "done":
                     self._running = False
                     return
@@ -724,10 +1062,13 @@ def run_copy_worker(sql_ci, adls_cfg, table_plan, q: queue.Queue):
         return
 
     now           = datetime.now()
-    container     = adls_cfg["container"]
+    dest          = adls_cfg.get("destination", "adls")
+    container     = adls_cfg["container"] if dest != "onelake" else _onelake_filesystem(adls_cfg)
     base          = adls_cfg.get("base_folder","").strip("/")
     path_template = adls_cfg.get("path_template",
                                   "{base}/{table}/{YYYY}/{MM}/{DD}/{file}.parquet")
+    emit("log", f"  Destinazione: {'OneLake' if dest=='onelake' else 'ADLS Gen2'}", "info")
+    emit("log", f"  Filesystem:   {container}", "info")
 
     import pandas as pd
 
@@ -743,49 +1084,70 @@ def run_copy_worker(sql_ci, adls_cfg, table_plan, q: queue.Queue):
         emit("progress", done, total, tname)
         emit("log",f"─── {fqn}  [{mode}]","info")
 
+        part_enabled = tbl.get("partition_enabled", False)
+        part_cols    = tbl.get("partition_cols", [])
+        last_run     = tbl.get("last_run", None)   # ISO string o None
+
         try:
             if mode == "FULL":
-                # ── FULL: leggi tutto ────────────────────────────────────────
                 sql_query = f"SELECT {col_sql} FROM {fqn}"
                 emit("log",f"  FULL SELECT {len(cols)} colonne…","info")
             else:
-                # ── INCREMENTALE ─────────────────────────────────────────────
+                # ── INCREMENTALE — usa last_run se disponibile ────────────────
                 if incr_field:
-                    # Filtro sul giorno corrente (date trunc)
-                    date_filter = now.strftime("%Y-%m-%d")
-                    sql_query = (f"SELECT {col_sql} FROM {fqn} "
-                                 f"WHERE CAST([{incr_field}] AS DATE) = '{date_filter}'")
-                    emit("log",f"  INCR su [{incr_field}] = {date_filter}","info")
+                    if last_run:
+                        # Filtra tutto ciò che è più recente dell'ultima esecuzione
+                        sql_query = (f"SELECT {col_sql} FROM {fqn} "
+                                     f"WHERE [{incr_field}] > '{last_run}'")
+                        emit("log",f"  INCR [{incr_field}] > '{last_run}'","info")
+                    else:
+                        # Prima esecuzione: usa la data di oggi come default
+                        date_filter = now.strftime("%Y-%m-%d")
+                        sql_query = (f"SELECT {col_sql} FROM {fqn} "
+                                     f"WHERE CAST([{incr_field}] AS DATE) = '{date_filter}'")
+                        emit("log",f"  INCR (prima esecuzione) [{incr_field}] = {date_filter}","warn")
                 else:
-                    # Campo data non configurato: copia tutto con avviso
                     sql_query = f"SELECT {col_sql} FROM {fqn}"
-                    emit("log",f"  INCR senza campo data → SELECT completo (nessun filtro)","warn")
+                    emit("log","  INCR senza campo data → SELECT completo (nessun filtro)","warn")
 
             df = pd.read_sql(sql_query, conn)
             emit("log",f"  Lette {len(df):,} righe  ({len(df.columns)} colonne)","ok")
 
-            # Percorso destinazione — calcolato dal template
+            # Percorso destinazione
+            eff_base = base
+            if adls_cfg.get("destination") == "onelake":
+                sub      = adls_cfg.get("ol_subfolder","").strip().strip("/")
+                eff_base = f"Files/{sub}" if sub else "Files"
+
             dest_file = resolve_path_template(
                 path_template,
-                base=base, schema=schema, table=tname,
+                base=eff_base, schema=schema, table=tname,
                 now=now, file_name=tname)
-            # La root per FULL delete è tutto ciò che precede i token data
-            # Usiamo base/table come root di cancellazione (sicuro: non tocca altre tabelle)
             tbl_root = resolve_path_template(
                 "{base}/{table}",
-                base=base, schema=schema, table=tname,
+                base=eff_base, schema=schema, table=tname,
                 now=now, file_name=tname)
             emit("log",f"  Percorso → {dest_file}","info")
 
             if mode == "FULL":
                 emit("log",f"  FULL → elimino {tbl_root}/…","warn")
                 adls_delete_folder(adls_client, container, tbl_root)
-            # INCREMENTALE: NON cancella — aggiunge la partizione del giorno
 
-            emit("log",f"  Upload → {dest_file}","info")
-            adls_upload_parquet(adls_client, container, dest_file, df)
+            # Upload (con o senza partizioni PyArrow)
+            valid_pcols = [c for c in part_cols if c in df.columns] if part_enabled else []
+            if valid_pcols:
+                emit("log",f"  Partizione su: {', '.join(valid_pcols)}","info")
+                adls_upload_parquet_partitioned(
+                    adls_client, container, tbl_root, df, valid_pcols, dest_file)
+            else:
+                emit("log",f"  Upload → {dest_file}","info")
+                adls_upload_parquet(adls_client, container, dest_file, df)
+
             emit("log",f"  ✓ Completato  ({len(df):,} righe)","ok")
+            # Comunica al main thread l'aggiornamento di last_run
+            emit("update_last_run", tname, now.isoformat(timespec="seconds"))
             done += 1
+
 
         except Exception as ex:
             emit("log",f"  ✗ ERRORE: {ex}","err")
@@ -1047,14 +1409,15 @@ class SchemaExplorer(tk.Tk):
         style.map("Schema.Treeview",background=[("selected",C_SKY)],foreground=[("selected",C_NAVY)])
         style.map("Schema.Treeview.Heading",background=[("active",C_HOVER)])
 
-        cols=("includi","caricamento","campo_data","tipo_dato","nullable")
+        cols=("includi","caricamento","campo_data","partizione","tipo_dato","nullable")
         self.tree=ttk.Treeview(container,columns=cols,show="tree headings",
                                 style="Schema.Treeview",selectmode="extended")
         self.tree.heading("#0",text="  Oggetto / Campo",anchor="w")
-        self.tree.column("#0",width=300,stretch=True,anchor="w")
+        self.tree.column("#0",width=280,stretch=True,anchor="w")
         for col,head,w in [("includi","✔ Includi",80),("caricamento","⟳ Caricamento",110),
-                            ("campo_data","📅 Campo Data",130),
-                            ("tipo_dato","Tipo Dato",120),("nullable","Nullable",70)]:
+                            ("campo_data","📅 Campo Data",120),
+                            ("partizione","⊟ Partizione",110),
+                            ("tipo_dato","Tipo Dato",110),("nullable","Nullable",70)]:
             self.tree.heading(col,text=head)
             self.tree.column(col,width=w,anchor="center",stretch=False)
 
@@ -1075,6 +1438,9 @@ class SchemaExplorer(tk.Tk):
         # campo data selezionato per incrementale
         self.tree.tag_configure("col_dt",  background="#E8F5E9",foreground="#1B5E20",font=("Calibri",10,"bold"))
         self.tree.tag_configure("col_dt2", background="#D4EDDA",foreground="#1B5E20",font=("Calibri",10,"bold"))
+        # colonna di partizione selezionata
+        self.tree.tag_configure("col_pt",  background="#FFF3E0",foreground="#E65100",font=("Calibri",10,"bold"))
+        self.tree.tag_configure("col_pt2", background="#FFE0B2",foreground="#E65100",font=("Calibri",10,"bold"))
 
         self.tree.bind("<ButtonRelease-1>",self._on_click)
         self.tree.bind("<space>",          self._on_space)
@@ -1114,7 +1480,8 @@ class SchemaExplorer(tk.Tk):
         self._table_meta={}
         for r in self._grid_data:
             tk=self._tkey(r["schema"],r["table_name"])
-            self._table_meta.setdefault(tk,{"load_mode":"FULL","incr_field":""})
+            self._table_meta.setdefault(tk,{"load_mode":"FULL","incr_field":"",
+                                               "partition_enabled":False,"partition_cols":[],"last_run":None})
         if overlay:
             for r in self._grid_data:
                 tk=self._tkey(r["schema"],r["table_name"])
@@ -1124,6 +1491,9 @@ class SchemaExplorer(tk.Tk):
                 if tk in self._table_meta:
                     self._table_meta[tk]["load_mode"]=tm.get("load_mode","FULL")
                     self._table_meta[tk]["incr_field"]=tm.get("incr_field","")
+                    self._table_meta[tk]["partition_enabled"]=tm.get("partition_enabled",False)
+                    self._table_meta[tk]["partition_cols"]=tm.get("partition_cols",[])
+                    self._table_meta[tk]["last_run"]=tm.get("last_run",None)
         self.lbl_db.config(text=f"● {server}  ›  {database}  ({len(rows):,} campi)",fg="#6EE7B7")
         self._apply_filter()
 
@@ -1139,14 +1509,20 @@ class SchemaExplorer(tk.Tk):
         self.wait_window(dlg)
         if dlg.result:
             self._adls_cfg=dlg.result
-            acc  = self._adls_cfg.get("account_name","")
-            con  = self._adls_cfg.get("container","")
+            dest = self._adls_cfg.get("destination","adls")
             tmpl = self._adls_cfg.get("path_template","")
-            # Mostra account/container e template abbreviato
-            short_tmpl = tmpl[:38]+"…" if len(tmpl)>38 else tmpl
-            lbl_txt = f"{acc}/{con}  [{short_tmpl}]" if acc else "(non configurato)"
+            short_tmpl = tmpl[:34]+"…" if len(tmpl)>34 else tmpl
+            if dest == "onelake":
+                ws = self._adls_cfg.get("workspace_name","")
+                lh = self._adls_cfg.get("lakehouse_name","")
+                lbl_txt = f"🔷 {ws}/{lh}  [{short_tmpl}]" if ws else "(non configurato)"
+            else:
+                acc = self._adls_cfg.get("account_name","")
+                con = self._adls_cfg.get("container","")
+                lbl_txt = f"🗄 {acc}/{con}  [{short_tmpl}]" if acc else "(non configurato)"
+            configured = bool(self._adls_cfg.get("account_name") or self._adls_cfg.get("workspace_name"))
             self._adls_lbl.config(text=lbl_txt,
-                                   fg=C_TEAL if acc else C_TEXT_MUT)
+                                   fg=C_TEAL if configured else C_TEXT_MUT)
 
     # ── Struttura dati ────────────────────────────────────────────────────────
     def _grouped(self,rows):
@@ -1195,21 +1571,40 @@ class SchemaExplorer(tk.Tk):
                 dt_lbl=f"📅 {incr_field}" if incr_field else "📅 — da selezionare —"
             else:
                 dt_lbl=""
+            # Partizione
+            part_enabled=meta.get("partition_enabled",False)
+            part_cols=meta.get("partition_cols",[])
+            if part_enabled and part_cols:
+                part_lbl=f"⊟ {', '.join(part_cols[:2])}{'…' if len(part_cols)>2 else ''}"
+            elif part_enabled:
+                part_lbl="⊟ — da selezionare —"
+            else:
+                part_lbl="⊡ off"
             tiid=f"tbl:{tk_}"
             self.tree.insert("","end",iid=tiid,text=f"  {ico}  {schema}.{tbl}",
-                values=(chk,mode_lbl,dt_lbl,obj,""),tags=(tag,),
+                values=(chk,mode_lbl,dt_lbl,part_lbl,obj,""),tags=(tag,),
                 open=(tiid in exp or not exp))
             for j,r in enumerate(fields):
                 inc=r["include"]; ch="☑" if inc else "☐"; nl="✓" if r["is_nullable"] else "✗"
                 is_dt=(mode=="INCREMENTALE" and r["column_name"]==incr_field and incr_field)
-                if is_dt:
-                    radio="◉"; tg="col_dt" if j%2==0 else "col_dt2"
+                is_pt=(part_enabled and r["column_name"] in part_cols)
+                if is_dt and is_pt:
+                    # campo sia data che partizione
+                    radio="◉"; pt_radio="◉"
+                    tg="col_dt" if j%2==0 else "col_dt2"
+                elif is_dt:
+                    radio="◉"; pt_radio="○" if part_enabled else ""
+                    tg="col_dt" if j%2==0 else "col_dt2"
+                elif is_pt:
+                    radio="○" if mode=="INCREMENTALE" else ""; pt_radio="◉"
+                    tg="col_pt" if j%2==0 else "col_pt2"
                 else:
                     radio="○" if mode=="INCREMENTALE" else ""
+                    pt_radio="○" if part_enabled else ""
                     even=j%2==0; tg=("col_inc" if even else "col_inc2") if inc else ("col_exc" if even else "col_exc2")
                 self.tree.insert(tiid,"end",iid=str(id(r)),
                     text=f"    {r['column_name']}",
-                    values=(ch,"",radio,r["data_type"],nl),tags=(tg,))
+                    values=(ch,"",radio,pt_radio,r["data_type"],nl),tags=(tg,))
         total=len(self._grid_data); ns=len(data)
         sc=sum(1 for r in self._grid_data if r["include"])
         ni=sum(1 for m in self._table_meta.values() if m["load_mode"]=="INCREMENTALE")
@@ -1217,9 +1612,11 @@ class SchemaExplorer(tk.Tk):
         # tabelle INCR senza campo data configurato
         n_warn=sum(1 for tk_,m in self._table_meta.items()
                    if m["load_mode"]=="INCREMENTALE" and not m.get("incr_field",""))
+        n_part=sum(1 for m in self._table_meta.values() if m.get("partition_enabled",False))
         warn_lbl=f"  ⚠ {n_warn} INCR senza campo data" if n_warn else ""
+        part_lbl=f"  ⊟ {n_part} partizionate" if n_part else ""
         self.lbl_count.config(text=f"Mostrati {ns:,} campi in {len(order)} oggetti  ·  totale {total:,}")
-        self.lbl_sel.config(text=f"Inclusi: {sc:,}/{total:,}  ·  INCR:{ni}  FULL:{nf}{warn_lbl}")
+        self.lbl_sel.config(text=f"Inclusi: {sc:,}/{total:,}  ·  INCR:{ni}  FULL:{nf}{warn_lbl}{part_lbl}")
 
     # ── Interazione griglia ───────────────────────────────────────────────────
     def _is_tbl(self,iid): return iid.startswith("tbl:")
@@ -1239,6 +1636,8 @@ class SchemaExplorer(tk.Tk):
         if col=="#1": self._tog_include(iid)
         elif col=="#2" and self._is_tbl(iid): self._tog_mode(iid)
         elif col=="#3" and not self._is_tbl(iid): self._tog_incr_field(iid)
+        elif col=="#4" and self._is_tbl(iid): self._tog_partition_enabled(iid)
+        elif col=="#4" and not self._is_tbl(iid): self._tog_partition_col(iid)
 
     def _on_space(self,event):
         for iid in self.tree.selection(): self._tog_include(iid)
@@ -1256,12 +1655,40 @@ class SchemaExplorer(tk.Tk):
 
     def _tog_mode(self,tiid):
         tk_=tiid[4:]
-        self._table_meta.setdefault(tk_,{"load_mode":"FULL"})
+        self._table_meta.setdefault(tk_,{"load_mode":"FULL","incr_field":"",
+                                          "partition_enabled":False,"partition_cols":[],"last_run":None})
         cur=self._table_meta[tk_]["load_mode"]
         self._table_meta[tk_]["load_mode"]="INCREMENTALE" if cur=="FULL" else "FULL"
-        # se torniamo a FULL, azzera il campo data
         if self._table_meta[tk_]["load_mode"]=="FULL":
             self._table_meta[tk_]["incr_field"]=""
+        self._apply_filter()
+
+    def _tog_partition_enabled(self,tiid):
+        """Abilita/disabilita il partizionamento su questa tabella."""
+        tk_=tiid[4:]
+        meta=self._table_meta.setdefault(tk_,{"load_mode":"FULL","incr_field":"",
+                                               "partition_enabled":False,"partition_cols":[],"last_run":None})
+        meta["partition_enabled"]=not meta.get("partition_enabled",False)
+        if not meta["partition_enabled"]:
+            meta["partition_cols"]=[]   # deseleziona tutte le colonne
+        self._apply_filter()
+
+    def _tog_partition_col(self,col_iid):
+        """Aggiunge/rimuove una colonna dall'elenco di partizione della tabella padre."""
+        parent_iid=self.tree.parent(col_iid)
+        if not parent_iid or not self._is_tbl(parent_iid): return
+        tk_=parent_iid[4:]
+        meta=self._table_meta.get(tk_,{})
+        if not meta.get("partition_enabled",False): return   # partizioni non abilitate
+        r=self._find_col(col_iid)
+        if not r: return
+        col_name=r["column_name"]
+        cols=list(meta.get("partition_cols",[]))
+        if col_name in cols:
+            cols.remove(col_name)
+        else:
+            cols.append(col_name)
+        meta["partition_cols"]=cols
         self._apply_filter()
 
     def _tog_incr_field(self,col_iid):
@@ -1294,8 +1721,9 @@ class SchemaExplorer(tk.Tk):
     def _run_copy(self):
         if not self._conn_info:
             messagebox.showerror("Errore","Nessuna connessione SQL Server configurata."); return
-        if not self._adls_cfg.get("account_name"):
-            messagebox.showerror("Errore","Configurazione ADLS non presente.\nUsa il pulsante '☁ ADLS Config'."); return
+        configured = bool(self._adls_cfg.get("account_name") or self._adls_cfg.get("workspace_name"))
+        if not configured:
+            messagebox.showerror("Errore","Configurazione storage non presente.\nUsa il pulsante '☁ ADLS Config'."); return
         if not self._grid_data:
             messagebox.showwarning("Attenzione","Nessun schema caricato."); return
 
@@ -1310,6 +1738,9 @@ class SchemaExplorer(tk.Tk):
                             "object_type":r["object_type"],
                             "load_mode":meta_.get("load_mode","FULL"),
                             "incr_field":meta_.get("incr_field",""),
+                            "partition_enabled":meta_.get("partition_enabled",False),
+                            "partition_cols":meta_.get("partition_cols",[]),
+                            "last_run":meta_.get("last_run",None),
                             "columns":[]}
             plan[tk_]["columns"].append(r["column_name"])
 
@@ -1322,21 +1753,36 @@ class SchemaExplorer(tk.Tk):
         # tabelle INCR senza campo data
         incr_no_field=[t["table_name"] for t in plan.values()
                        if t["load_mode"]=="INCREMENTALE" and not t.get("incr_field","")]
-        acc=self._adls_cfg["account_name"]; con=self._adls_cfg["container"]
+        dest_mode = self._adls_cfg.get("destination","adls")
+        if dest_mode == "onelake":
+            dest_line = (f"  Workspace:  {self._adls_cfg.get('workspace_name','?')}\n"
+                         f"  Lakehouse:  {self._adls_cfg.get('lakehouse_name','?')}")
+            dest_title = "Microsoft Fabric OneLake"
+        else:
+            dest_line = (f"  Account:    {self._adls_cfg.get('account_name','?')}\n"
+                         f"  Container:  {self._adls_cfg.get('container','?')}")
+            dest_title = "ADLS Gen2"
         warn_txt=""
         if incr_no_field:
             nomi=", ".join(incr_no_field[:5])+("…" if len(incr_no_field)>5 else "")
             warn_txt=(f"\n\n⚠  {len(incr_no_field)} tabella/e INCREMENTALE senza campo data:\n"
                       f"  {nomi}\n  → verranno copiate SENZA filtro data (tutte le righe).")
         if not messagebox.askyesno("Conferma esecuzione",
-            f"Stai per copiare {n_tbl} tabelle su ADLS Gen2:\n\n"
-            f"  Account:    {acc}\n  Container:  {con}\n"
+            f"Stai per copiare {n_tbl} tabelle su {dest_title}:\n\n"
+            f"{dest_line}\n"
             f"  FULL:  {n_full}   INCREMENTALE: {n_incr}"
             f"{warn_txt}\n\n"
             "Le tabelle FULL verranno cancellate e riscritte.\nProcedere?"):
             return
 
-        dlg=RunDialog(self)
+        def _on_last_run(table_name, iso_ts):
+            """Aggiorna last_run nel table_meta quando il worker completa una tabella."""
+            for tk_, meta_ in self._table_meta.items():
+                if tk_.split(".")[-1] == table_name or tk_.endswith(f".{table_name}"):
+                    meta_["last_run"] = iso_ts
+                    break
+
+        dlg=RunDialog(self, on_last_run=_on_last_run)
         dlg._running=True
         q=dlg._q
         t=threading.Thread(target=run_copy_worker,
@@ -1357,11 +1803,15 @@ class SchemaExplorer(tk.Tk):
         tables={}
         for r in self._grid_data:
             tk_=self._tkey(r["schema"],r["table_name"])
+            meta_=self._table_meta.get(tk_,{})
             tables.setdefault(tk_,{
                 "schema":r["schema"],"table_name":r["table_name"],
                 "object_type":r["object_type"],
-                "load_mode":self._table_meta.get(tk_,{}).get("load_mode","FULL"),
-                "incr_field":self._table_meta.get(tk_,{}).get("incr_field",""),
+                "load_mode":meta_.get("load_mode","FULL"),
+                "incr_field":meta_.get("incr_field",""),
+                "partition_enabled":meta_.get("partition_enabled",False),
+                "partition_cols":meta_.get("partition_cols",[]),
+                "last_run":meta_.get("last_run",None),
                 "columns":{}})
             tables[tk_]["columns"][r["column_name"]]={
                 "include":r["include"],"data_type":r["data_type"],
@@ -1443,6 +1893,9 @@ class SchemaExplorer(tk.Tk):
 
         overlay={tk_:{"load_mode":td.get("load_mode","FULL"),
                       "incr_field":td.get("incr_field",""),
+                      "partition_enabled":td.get("partition_enabled",False),
+                      "partition_cols":td.get("partition_cols",[]),
+                      "last_run":td.get("last_run",None),
                       "columns":{c:cd.get("include",True) for c,cd in td.get("columns",{}).items()}}
                  for tk_,td in tables_cfg.items()}
 
@@ -1473,6 +1926,9 @@ class SchemaExplorer(tk.Tk):
             if tk_ in self._table_meta:
                 self._table_meta[tk_]["load_mode"]=tm.get("load_mode","FULL")
                 self._table_meta[tk_]["incr_field"]=tm.get("incr_field","")
+                self._table_meta[tk_]["partition_enabled"]=tm.get("partition_enabled",False)
+                self._table_meta[tk_]["partition_cols"]=tm.get("partition_cols",[])
+                self._table_meta[tk_]["last_run"]=tm.get("last_run",None)
         self._apply_filter()
         messagebox.showinfo("Flag applicati",f"Flag applicati su {len(overlay)} tabelle.")
 
