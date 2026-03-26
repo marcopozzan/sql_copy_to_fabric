@@ -420,7 +420,6 @@ I file Parquet prodotti sono direttamente compatibili con:
 AI & Business Intelligence · Microsoft Fabric · Power BI · Azure  
 Polo Tecnologico di Pordenone — Friuli Venezia Giulia
 
-> *"Come i navigatori del Quattrocento tracciavano rotte verso l'ignoto, noi guidiamo le imprese verso il futuro dei dati."*
 
 ---
 
