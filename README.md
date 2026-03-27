@@ -36,11 +36,11 @@ I due file devono trovarsi nella **stessa directory**: il runner importa le funz
 
 - **Connessione SQL Server** con profili configurabili (Windows Auth / SQL Server Auth), supporto per più versioni di driver ODBC
 - **Griglia gerarchica** tabelle → campi con flag configurabili per ogni livello:
-  - ✔ **Includi/Escludi** per singolo campo o per tutta la tabella (toggle batch)
-  - ⊞ **FULL** — cancella e riscrive la cartella radice della tabella
-  - ⟳ **INCREMENTALE** — filtra i record più recenti dell'ultima esecuzione usando un campo data configurabile; alla prima esecuzione prende solo il giorno corrente
-  - 📅 **Campo Data** — radio button per scegliere la colonna usata come filtro incrementale
-  - ⊟ **Partizione** — flag per abilitare il partizionamento Parquet; selezione multipla delle colonne di partizione (formato Hive: `col=val/col2=val2/part-0.parquet`)
+  - **Includi/Escludi** per singolo campo o per tutta la tabella (toggle batch)
+  - **FULL** — cancella e riscrive la cartella radice della tabella
+  - **INCREMENTALE** — filtra i record più recenti dell'ultima esecuzione usando un campo data configurabile; alla prima esecuzione prende solo il giorno corrente
+  - **Campo Data** — radio button per scegliere la colonna usata come filtro incrementale
+  - **Partizione** — flag per abilitare il partizionamento Parquet; selezione multipla delle colonne di partizione (formato Hive: `col=val/col2=val2/part-0.parquet`)
 - **Destinazione storage** — ADLS Gen2 o Microsoft Fabric OneLake, selezionabile nella stessa dialog
 - **Template percorso file** personalizzabile con token: `{base}`, `{schema}`, `{table}`, `{YYYY}`, `{MM}`, `{DD}`, `{file}`
 - **Salvataggio/caricamento configurazione JSON** con password DB cifrata (Fernet/AES-128, PBKDF2-HMAC-SHA256)
@@ -122,13 +122,13 @@ python sql_copy_runner.py config.json "pwd" --tables dbo.Clienti,dbo.Ordini --lo
    - colonne di partizione (opzionale)
         │
         ▼
-4. Configura destinazione storage (☁ ADLS Config)
+4. Configura destinazione storage (ADLS Config)
    - ADLS Gen2: account, container, autenticazione
    - OneLake: workspace, lakehouse, autenticazione
    - template percorso file
         │
         ▼
-5. 💾 Salva JSON  →  config.json
+5. Salva JSON  →  config.json
    (la password DB viene cifrata con passphrase)
         │
         ▼
